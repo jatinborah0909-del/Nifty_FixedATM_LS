@@ -2,15 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-NIFTY LONG STRADDLE
-------------------
+NIFTY LONG STRADDLE – SCHEMA SAFE
+--------------------------------
 ✔ No ATM rolling
 ✔ Exit ONLY on Target / SL
 ✔ Re-entry only after full exit
 ✔ FUT-based ATR (minute candles)
 ✔ ATR stored in DB
 ✔ Dynamic FUT + Option symbol resolution
-✔ Uses `timestamp` column (FIXED)
+✔ AUTO schema migration (NO column errors)
 ✔ Railway compatible
 """
 
@@ -20,17 +20,12 @@ import psycopg2
 from kiteconnect import KiteConnect
 
 # =========================================================
-# CONFIG (ENV SAFE)
+# CONFIG
 # =========================================================
-
-TRADE_MODE = os.getenv("TRADE_MODE", "PAPER")
 
 API_KEY = os.getenv("KITE_API_KEY", "")
 ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN", "")
-
 DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL not set")
 
 ENTRY_TOL = int(os.getenv("ENTRY_TOL", 10))
 QTY_PER_LEG = int(os.getenv("QTY_PER_LEG", 65))
@@ -41,7 +36,6 @@ SNAPSHOT_INTERVAL = int(os.getenv("SNAPSHOT_INTERVAL", 30))
 INDEX_SYMBOL = "NSE:NIFTY 50"
 UNDERLYING = "NIFTY"
 STRIKE_STEP = 50
-
 ATR_PERIOD = 14
 TICK_INTERVAL = 1
 
@@ -61,18 +55,15 @@ kite.set_access_token(ACCESS_TOKEN)
 NFO_INSTRUMENTS = kite.instruments("NFO")
 
 def get_nearest_nifty_fut():
-    futs = [
-        i for i in NFO_INSTRUMENTS
-        if i["instrument_type"] == "FUT" and i["name"] == "NIFTY"
-    ]
+    futs = [i for i in NFO_INSTRUMENTS if i["name"] == "NIFTY" and i["instrument_type"] == "FUT"]
     futs.sort(key=lambda x: x["expiry"])
     return "NFO:" + futs[0]["tradingsymbol"]
 
 def get_nearest_option(strike, opt_type):
     opts = [
         i for i in NFO_INSTRUMENTS
-        if i["instrument_type"] == opt_type
-        and i["name"] == "NIFTY"
+        if i["name"] == "NIFTY"
+        and i["instrument_type"] == opt_type
         and i["strike"] == strike
     ]
     if not opts:
@@ -81,7 +72,7 @@ def get_nearest_option(strike, opt_type):
     return "NFO:" + opts[0]["tradingsymbol"]
 
 FUT_SYMBOL = get_nearest_nifty_fut()
-print("✅ Using FUT:", FUT_SYMBOL)
+print("✅ FUT:", FUT_SYMBOL)
 
 # =========================================================
 # ATR BUILDER
@@ -128,7 +119,7 @@ class FutAtrBuilder:
         return self.atr
 
 # =========================================================
-# DB HELPERS (timestamp FIXED)
+# DB (AUTO-MIGRATING)
 # =========================================================
 
 def get_conn():
@@ -138,23 +129,23 @@ def ensure_table():
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("""
         CREATE TABLE IF NOT EXISTS niftylong_strangle (
-            timestamp TIMESTAMPTZ,
-            status TEXT,
-            event TEXT,
-            reason TEXT,
-            spot DOUBLE PRECISION,
-            ce_entry DOUBLE PRECISION,
-            pe_entry DOUBLE PRECISION,
-            ce_ltp DOUBLE PRECISION,
-            pe_ltp DOUBLE PRECISION,
-            unreal_pnl DOUBLE PRECISION,
-            realized_pnl DOUBLE PRECISION,
-            atr DOUBLE PRECISION
+            timestamp TIMESTAMPTZ
         );
         """)
+
         cur.execute("""
         ALTER TABLE niftylong_strangle
-        ADD COLUMN IF NOT EXISTS timestamp TIMESTAMPTZ;
+        ADD COLUMN IF NOT EXISTS status TEXT,
+        ADD COLUMN IF NOT EXISTS event TEXT,
+        ADD COLUMN IF NOT EXISTS reason TEXT,
+        ADD COLUMN IF NOT EXISTS spot DOUBLE PRECISION,
+        ADD COLUMN IF NOT EXISTS ce_entry DOUBLE PRECISION,
+        ADD COLUMN IF NOT EXISTS pe_entry DOUBLE PRECISION,
+        ADD COLUMN IF NOT EXISTS ce_ltp DOUBLE PRECISION,
+        ADD COLUMN IF NOT EXISTS pe_ltp DOUBLE PRECISION,
+        ADD COLUMN IF NOT EXISTS unreal_pnl DOUBLE PRECISION,
+        ADD COLUMN IF NOT EXISTS realized_pnl DOUBLE PRECISION,
+        ADD COLUMN IF NOT EXISTS atr DOUBLE PRECISION;
         """)
         conn.commit()
 
@@ -163,10 +154,7 @@ def log_db(**row):
     vals = tuple(row.values())
     ph = ",".join(["%s"] * len(vals))
     with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            f"INSERT INTO niftylong_strangle ({cols}) VALUES ({ph})",
-            vals
-        )
+        cur.execute(f"INSERT INTO niftylong_strangle ({cols}) VALUES ({ph})", vals)
         conn.commit()
 
 # =========================================================
@@ -196,7 +184,7 @@ def is_near_strike(spot):
 # =========================================================
 
 ensure_table()
-print("🚀 NIFTY Long Straddle started")
+print("🚀 Bot started")
 
 while True:
     try:
@@ -204,13 +192,11 @@ while True:
 
         spot = kite.ltp([INDEX_SYMBOL])[INDEX_SYMBOL]["last_price"]
         fut = kite.ltp([FUT_SYMBOL])[FUT_SYMBOL]["last_price"]
-
         atr = atr_builder.update(now, fut)
 
-        # ================= ENTRY =================
+        # ENTRY
         if not position_open and is_near_strike(spot):
             atm = round_to_strike(spot)
-
             ce_symbol = get_nearest_option(atm, "CE")
             pe_symbol = get_nearest_option(atm, "PE")
             if not ce_symbol or not pe_symbol:
@@ -219,7 +205,6 @@ while True:
 
             ce_entry = kite.ltp([ce_symbol])[ce_symbol]["last_price"]
             pe_entry = kite.ltp([pe_symbol])[pe_symbol]["last_price"]
-
             position_open = True
 
             log_db(
@@ -237,11 +222,10 @@ while True:
                 atr=atr
             )
 
-        # ================= MONITOR =================
+        # MONITOR
         if position_open:
             ce_ltp = kite.ltp([ce_symbol])[ce_symbol]["last_price"]
             pe_ltp = kite.ltp([pe_symbol])[pe_symbol]["last_price"]
-
             unreal = (ce_ltp - ce_entry + pe_ltp - pe_entry) * QTY_PER_LEG
 
             if unreal >= PROFIT_TARGET or unreal <= -STOP_LOSS:
