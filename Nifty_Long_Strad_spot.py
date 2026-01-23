@@ -2,16 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-NIFTY LONG STRADDLE (FIXED & RAILWAY SAFE)
-----------------------------------------
+NIFTY LONG STRADDLE
+------------------
 ✔ No ATM rolling
 ✔ Exit ONLY on Target / SL
 ✔ Re-entry only after full exit
 ✔ FUT-based ATR (minute candles)
 ✔ ATR stored in DB
 ✔ Dynamic FUT + Option symbol resolution
+✔ Uses `timestamp` column (FIXED)
 ✔ Railway compatible
-✔ Key parameters via ENV variables
 """
 
 import os, time, math, pytz
@@ -55,7 +55,7 @@ kite = KiteConnect(api_key=API_KEY)
 kite.set_access_token(ACCESS_TOKEN)
 
 # =========================================================
-# INSTRUMENT RESOLUTION (CRITICAL FIX)
+# INSTRUMENT RESOLUTION
 # =========================================================
 
 NFO_INSTRUMENTS = kite.instruments("NFO")
@@ -63,13 +63,12 @@ NFO_INSTRUMENTS = kite.instruments("NFO")
 def get_nearest_nifty_fut():
     futs = [
         i for i in NFO_INSTRUMENTS
-        if i["instrument_type"] == "FUT"
-        and i["name"] == "NIFTY"
+        if i["instrument_type"] == "FUT" and i["name"] == "NIFTY"
     ]
     futs.sort(key=lambda x: x["expiry"])
     return "NFO:" + futs[0]["tradingsymbol"]
 
-def get_nearest_option(strike: int, opt_type: str):
+def get_nearest_option(strike, opt_type):
     opts = [
         i for i in NFO_INSTRUMENTS
         if i["instrument_type"] == opt_type
@@ -85,55 +84,51 @@ FUT_SYMBOL = get_nearest_nifty_fut()
 print("✅ Using FUT:", FUT_SYMBOL)
 
 # =========================================================
-# ATR BUILDER (UNCHANGED)
+# ATR BUILDER
 # =========================================================
 
 class FutAtrBuilder:
-    def __init__(self, atr_period):
-        self.atr_period = atr_period
-        self.tr_history = []
-        self.last_minute_key = None
-        self.minute_high = None
-        self.minute_low = None
-        self.minute_close = None
-        self.prev_close = None
-        self.atr_val = None
+    def __init__(self, period):
+        self.period = period
+        self.trs = []
+        self.last_min = None
+        self.h = self.l = self.c = self.prev_c = None
+        self.atr = None
 
-    def update(self, now, fut_ltp):
-        if fut_ltp is None or math.isnan(fut_ltp):
-            return self.atr_val
+    def update(self, now, ltp):
+        if ltp is None or math.isnan(ltp):
+            return self.atr
 
-        minute_key = now.replace(second=0, microsecond=0)
+        mk = now.replace(second=0, microsecond=0)
 
-        if self.last_minute_key is None:
-            self.last_minute_key = minute_key
-            self.minute_high = self.minute_low = self.minute_close = self.prev_close = fut_ltp
-            return self.atr_val
+        if self.last_min is None:
+            self.last_min = mk
+            self.h = self.l = self.c = self.prev_c = ltp
+            return self.atr
 
-        if minute_key == self.last_minute_key:
-            self.minute_high = max(self.minute_high, fut_ltp)
-            self.minute_low = min(self.minute_low, fut_ltp)
-            self.minute_close = fut_ltp
-            return self.atr_val
+        if mk == self.last_min:
+            self.h = max(self.h, ltp)
+            self.l = min(self.l, ltp)
+            self.c = ltp
+            return self.atr
 
         tr = max(
-            self.minute_high - self.minute_low,
-            abs(self.minute_high - self.prev_close),
-            abs(self.minute_low - self.prev_close),
+            self.h - self.l,
+            abs(self.h - self.prev_c),
+            abs(self.l - self.prev_c),
         )
-        self.tr_history.append(tr)
+        self.trs.append(tr)
 
-        if len(self.tr_history) >= self.atr_period:
-            self.atr_val = round(sum(self.tr_history[-self.atr_period:]) / self.atr_period, 2)
+        if len(self.trs) >= self.period:
+            self.atr = round(sum(self.trs[-self.period:]) / self.period, 2)
 
-        self.prev_close = self.minute_close
-        self.last_minute_key = minute_key
-        self.minute_high = self.minute_low = self.minute_close = fut_ltp
-
-        return self.atr_val
+        self.prev_c = self.c
+        self.last_min = mk
+        self.h = self.l = self.c = ltp
+        return self.atr
 
 # =========================================================
-# DB HELPERS
+# DB HELPERS (timestamp FIXED)
 # =========================================================
 
 def get_conn():
@@ -143,7 +138,7 @@ def ensure_table():
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("""
         CREATE TABLE IF NOT EXISTS niftylong_strangle (
-            ts TIMESTAMPTZ,
+            timestamp TIMESTAMPTZ,
             status TEXT,
             event TEXT,
             reason TEXT,
@@ -157,6 +152,10 @@ def ensure_table():
             atr DOUBLE PRECISION
         );
         """)
+        cur.execute("""
+        ALTER TABLE niftylong_strangle
+        ADD COLUMN IF NOT EXISTS timestamp TIMESTAMPTZ;
+        """)
         conn.commit()
 
 def log_db(**row):
@@ -164,7 +163,10 @@ def log_db(**row):
     vals = tuple(row.values())
     ph = ",".join(["%s"] * len(vals))
     with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(f"INSERT INTO niftylong_strangle ({cols}) VALUES ({ph})", vals)
+        cur.execute(
+            f"INSERT INTO niftylong_strangle ({cols}) VALUES ({ph})",
+            vals
+        )
         conn.commit()
 
 # =========================================================
@@ -221,10 +223,15 @@ while True:
             position_open = True
 
             log_db(
-                ts=now, status="OPEN", event="ENTRY", reason="ATM",
+                timestamp=now,
+                status="OPEN",
+                event="ENTRY",
+                reason="ATM",
                 spot=spot,
-                ce_entry=ce_entry, pe_entry=pe_entry,
-                ce_ltp=ce_entry, pe_ltp=pe_entry,
+                ce_entry=ce_entry,
+                pe_entry=pe_entry,
+                ce_ltp=ce_entry,
+                pe_ltp=pe_entry,
                 unreal_pnl=0.0,
                 realized_pnl=realized_pnl,
                 atr=atr
@@ -242,11 +249,15 @@ while True:
                 position_open = False
 
                 log_db(
-                    ts=now, status="EXIT", event="EXIT",
+                    timestamp=now,
+                    status="EXIT",
+                    event="EXIT",
                     reason="TARGET" if unreal >= PROFIT_TARGET else "SL",
                     spot=spot,
-                    ce_entry=ce_entry, pe_entry=pe_entry,
-                    ce_ltp=ce_ltp, pe_ltp=pe_ltp,
+                    ce_entry=ce_entry,
+                    pe_entry=pe_entry,
+                    ce_ltp=ce_ltp,
+                    pe_ltp=pe_ltp,
                     unreal_pnl=unreal,
                     realized_pnl=realized_pnl,
                     atr=atr
@@ -256,10 +267,15 @@ while True:
                 last_snapshot_ts = time.time()
 
                 log_db(
-                    ts=now, status="RUNNING", event="", reason="",
+                    timestamp=now,
+                    status="RUNNING",
+                    event="",
+                    reason="",
                     spot=spot,
-                    ce_entry=ce_entry, pe_entry=pe_entry,
-                    ce_ltp=ce_ltp, pe_ltp=pe_ltp,
+                    ce_entry=ce_entry,
+                    pe_entry=pe_entry,
+                    ce_ltp=ce_ltp,
+                    pe_ltp=pe_ltp,
                     unreal_pnl=unreal,
                     realized_pnl=realized_pnl,
                     atr=atr
