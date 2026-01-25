@@ -4,6 +4,7 @@
 """
 NIFTY LONG STRADDLE – SCHEMA SAFE
 --------------------------------
+
 ✔ No ATM rolling
 ✔ Exit ONLY on Target / SL
 ✔ Re-entry only after full exit
@@ -12,10 +13,11 @@ NIFTY LONG STRADDLE – SCHEMA SAFE
 ✔ Dynamic FUT + Option symbol resolution
 ✔ AUTO schema migration (NO column errors)
 ✔ Railway compatible
+✔ Runs ONLY between 09:15 and 15:30 IST
 """
 
 import os, time, math, pytz
-from datetime import datetime
+from datetime import datetime, time as dt_time
 import psycopg2
 from kiteconnect import KiteConnect
 
@@ -40,6 +42,10 @@ ATR_PERIOD = 14
 TICK_INTERVAL = 1
 
 MARKET_TZ = pytz.timezone("Asia/Kolkata")
+
+# ✅ MARKET HOURS
+MARKET_START = dt_time(9, 15)
+MARKET_END   = dt_time(15, 30)
 
 # =========================================================
 # KITE
@@ -179,6 +185,10 @@ def round_to_strike(price):
 def is_near_strike(spot):
     return abs(spot - round_to_strike(spot)) <= ENTRY_TOL
 
+def in_market_hours(now):
+    t = now.time()
+    return MARKET_START <= t <= MARKET_END
+
 # =========================================================
 # MAIN LOOP
 # =========================================================
@@ -190,11 +200,16 @@ while True:
     try:
         now = datetime.now(MARKET_TZ)
 
+        # ❌ Outside market hours → do nothing
+        if not in_market_hours(now):
+            time.sleep(5)
+            continue
+
         spot = kite.ltp([INDEX_SYMBOL])[INDEX_SYMBOL]["last_price"]
         fut = kite.ltp([FUT_SYMBOL])[FUT_SYMBOL]["last_price"]
         atr = atr_builder.update(now, fut)
 
-        # ENTRY
+        # ================= ENTRY =================
         if not position_open and is_near_strike(spot):
             atm = round_to_strike(spot)
             ce_symbol = get_nearest_option(atm, "CE")
@@ -222,7 +237,7 @@ while True:
                 atr=atr
             )
 
-        # MONITOR
+        # ================= MONITOR =================
         if position_open:
             ce_ltp = kite.ltp([ce_symbol])[ce_symbol]["last_price"]
             pe_ltp = kite.ltp([pe_symbol])[pe_symbol]["last_price"]
