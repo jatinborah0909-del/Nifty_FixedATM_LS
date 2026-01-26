@@ -4,7 +4,6 @@
 """
 NIFTY LONG STRADDLE – SCHEMA SAFE
 --------------------------------
-
 ✔ No ATM rolling
 ✔ Exit ONLY on Target / SL
 ✔ Re-entry only after full exit
@@ -13,7 +12,7 @@ NIFTY LONG STRADDLE – SCHEMA SAFE
 ✔ Dynamic FUT + Option symbol resolution
 ✔ AUTO schema migration (NO column errors)
 ✔ Railway compatible
-✔ Runs ONLY between 09:15 and 15:30 IST
+✔ Market hours via ENV variables
 """
 
 import os, time, math, pytz
@@ -35,6 +34,10 @@ PROFIT_TARGET = float(os.getenv("PROFIT_TARGET", 1500))
 STOP_LOSS = float(os.getenv("STOP_LOSS", 1500))
 SNAPSHOT_INTERVAL = int(os.getenv("SNAPSHOT_INTERVAL", 30))
 
+# ✅ MARKET HOURS (ENV DRIVEN)
+MARKET_START_TIME = os.getenv("MARKET_START_TIME", "09:15")
+MARKET_END_TIME   = os.getenv("MARKET_END_TIME", "15:30")
+
 INDEX_SYMBOL = "NSE:NIFTY 50"
 UNDERLYING = "NIFTY"
 STRIKE_STEP = 50
@@ -43,9 +46,12 @@ TICK_INTERVAL = 1
 
 MARKET_TZ = pytz.timezone("Asia/Kolkata")
 
-# ✅ MARKET HOURS
-MARKET_START = dt_time(9, 15)
-MARKET_END   = dt_time(15, 30)
+def parse_time(tstr: str) -> dt_time:
+    h, m = map(int, tstr.split(":"))
+    return dt_time(h, m)
+
+MARKET_START = parse_time(MARKET_START_TIME)
+MARKET_END   = parse_time(MARKET_END_TIME)
 
 # =========================================================
 # KITE
@@ -195,6 +201,7 @@ def in_market_hours(now):
 
 ensure_table()
 print("🚀 Bot started")
+print(f"⏰ Market hours: {MARKET_START} → {MARKET_END}")
 
 while True:
     try:
