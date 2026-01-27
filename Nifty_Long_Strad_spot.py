@@ -2,15 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-NIFTY LONG STRADDLE – SCHEMA SAFE
---------------------------------
+NIFTY LONG STRADDLE – SCHEMA SAFE (FIXED)
+---------------------------------------
 ✔ No ATM rolling
 ✔ Exit ONLY on Target / SL
 ✔ Re-entry only after full exit
 ✔ FUT-based ATR (minute candles)
 ✔ ATR stored in DB
-✔ Dynamic FUT + Option symbol resolution
-✔ AUTO schema migration (NO column errors)
+✔ CE / PE SYMBOL + STRIKE STORED ✅
+✔ AUTO schema migration
 ✔ Railway compatible
 ✔ Market hours via ENV variables
 """
@@ -34,7 +34,6 @@ PROFIT_TARGET = float(os.getenv("PROFIT_TARGET", 1500))
 STOP_LOSS = float(os.getenv("STOP_LOSS", 1500))
 SNAPSHOT_INTERVAL = int(os.getenv("SNAPSHOT_INTERVAL", 30))
 
-# ✅ MARKET HOURS (ENV DRIVEN)
 MARKET_START_TIME = os.getenv("MARKET_START_TIME", "09:15")
 MARKET_END_TIME   = os.getenv("MARKET_END_TIME", "15:30")
 
@@ -46,8 +45,8 @@ TICK_INTERVAL = 1
 
 MARKET_TZ = pytz.timezone("Asia/Kolkata")
 
-def parse_time(tstr: str) -> dt_time:
-    h, m = map(int, tstr.split(":"))
+def parse_time(t):
+    h, m = map(int, t.split(":"))
     return dt_time(h, m)
 
 MARKET_START = parse_time(MARKET_START_TIME)
@@ -131,7 +130,7 @@ class FutAtrBuilder:
         return self.atr
 
 # =========================================================
-# DB (AUTO-MIGRATING)
+# DB (AUTO MIGRATING)
 # =========================================================
 
 def get_conn():
@@ -151,6 +150,12 @@ def ensure_table():
         ADD COLUMN IF NOT EXISTS event TEXT,
         ADD COLUMN IF NOT EXISTS reason TEXT,
         ADD COLUMN IF NOT EXISTS spot DOUBLE PRECISION,
+
+        ADD COLUMN IF NOT EXISTS ce_symbol TEXT,
+        ADD COLUMN IF NOT EXISTS pe_symbol TEXT,
+        ADD COLUMN IF NOT EXISTS ce_strike INTEGER,
+        ADD COLUMN IF NOT EXISTS pe_strike INTEGER,
+
         ADD COLUMN IF NOT EXISTS ce_entry DOUBLE PRECISION,
         ADD COLUMN IF NOT EXISTS pe_entry DOUBLE PRECISION,
         ADD COLUMN IF NOT EXISTS ce_ltp DOUBLE PRECISION,
@@ -175,6 +180,7 @@ def log_db(**row):
 
 position_open = False
 ce_symbol = pe_symbol = None
+ce_strike = pe_strike = None
 ce_entry = pe_entry = None
 realized_pnl = 0.0
 
@@ -201,26 +207,29 @@ def in_market_hours(now):
 
 ensure_table()
 print("🚀 Bot started")
-print(f"⏰ Market hours: {MARKET_START} → {MARKET_END}")
 
 while True:
     try:
         now = datetime.now(MARKET_TZ)
 
-        # ❌ Outside market hours → do nothing
         if not in_market_hours(now):
             time.sleep(5)
             continue
 
         spot = kite.ltp([INDEX_SYMBOL])[INDEX_SYMBOL]["last_price"]
-        fut = kite.ltp([FUT_SYMBOL])[FUT_SYMBOL]["last_price"]
-        atr = atr_builder.update(now, fut)
+        fut  = kite.ltp([FUT_SYMBOL])[FUT_SYMBOL]["last_price"]
+        atr  = atr_builder.update(now, fut)
 
         # ================= ENTRY =================
         if not position_open and is_near_strike(spot):
             atm = round_to_strike(spot)
-            ce_symbol = get_nearest_option(atm, "CE")
-            pe_symbol = get_nearest_option(atm, "PE")
+
+            ce_strike = atm
+            pe_strike = atm
+
+            ce_symbol = get_nearest_option(ce_strike, "CE")
+            pe_symbol = get_nearest_option(pe_strike, "PE")
+
             if not ce_symbol or not pe_symbol:
                 time.sleep(1)
                 continue
@@ -235,6 +244,10 @@ while True:
                 event="ENTRY",
                 reason="ATM",
                 spot=spot,
+                ce_symbol=ce_symbol,
+                pe_symbol=pe_symbol,
+                ce_strike=ce_strike,
+                pe_strike=pe_strike,
                 ce_entry=ce_entry,
                 pe_entry=pe_entry,
                 ce_ltp=ce_entry,
@@ -248,6 +261,7 @@ while True:
         if position_open:
             ce_ltp = kite.ltp([ce_symbol])[ce_symbol]["last_price"]
             pe_ltp = kite.ltp([pe_symbol])[pe_symbol]["last_price"]
+
             unreal = (ce_ltp - ce_entry + pe_ltp - pe_entry) * QTY_PER_LEG
 
             if unreal >= PROFIT_TARGET or unreal <= -STOP_LOSS:
@@ -260,6 +274,10 @@ while True:
                     event="EXIT",
                     reason="TARGET" if unreal >= PROFIT_TARGET else "SL",
                     spot=spot,
+                    ce_symbol=ce_symbol,
+                    pe_symbol=pe_symbol,
+                    ce_strike=ce_strike,
+                    pe_strike=pe_strike,
                     ce_entry=ce_entry,
                     pe_entry=pe_entry,
                     ce_ltp=ce_ltp,
@@ -278,6 +296,10 @@ while True:
                     event="",
                     reason="",
                     spot=spot,
+                    ce_symbol=ce_symbol,
+                    pe_symbol=pe_symbol,
+                    ce_strike=ce_strike,
+                    pe_strike=pe_strike,
                     ce_entry=ce_entry,
                     pe_entry=pe_entry,
                     ce_ltp=ce_ltp,
