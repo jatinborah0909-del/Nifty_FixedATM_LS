@@ -2,17 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-NIFTY LONG STRADDLE – SCHEMA SAFE (FIXED)
----------------------------------------
+NIFTY LONG STRADDLE – SCHEMA SAFE (FIXED + VIX)
+---------------------------------------------
 ✔ No ATM rolling
 ✔ Exit ONLY on Target / SL
 ✔ Re-entry only after full exit
 ✔ FUT-based ATR (minute candles)
 ✔ ATR stored in DB
-✔ CE / PE SYMBOL + STRIKE STORED ✅
+✔ CE / PE SYMBOL + STRIKE STORED
+✔ VIX (PREV CLOSE + LIVE) STORED
 ✔ AUTO schema migration
 ✔ Railway compatible
-✔ Market hours via ENV variables
 """
 
 import os, time, math, pytz
@@ -38,7 +38,6 @@ MARKET_START_TIME = os.getenv("MARKET_START_TIME", "09:15")
 MARKET_END_TIME   = os.getenv("MARKET_END_TIME", "15:30")
 
 INDEX_SYMBOL = "NSE:NIFTY 50"
-UNDERLYING = "NIFTY"
 STRIKE_STEP = 50
 ATR_PERIOD = 14
 TICK_INTERVAL = 1
@@ -84,6 +83,17 @@ def get_nearest_option(strike, opt_type):
 
 FUT_SYMBOL = get_nearest_nifty_fut()
 print("✅ FUT:", FUT_SYMBOL)
+
+# =========================================================
+# VIX
+# =========================================================
+
+def get_vix():
+    q = kite.quote(["NSE:INDIA VIX"])
+    d = q["NSE:INDIA VIX"]
+    vix_prev = float(d["ohlc"]["close"]) if d.get("ohlc") else None
+    vix = float(d["last_price"]) if d.get("last_price") else None
+    return vix_prev, vix
 
 # =========================================================
 # ATR BUILDER
@@ -160,9 +170,13 @@ def ensure_table():
         ADD COLUMN IF NOT EXISTS pe_entry DOUBLE PRECISION,
         ADD COLUMN IF NOT EXISTS ce_ltp DOUBLE PRECISION,
         ADD COLUMN IF NOT EXISTS pe_ltp DOUBLE PRECISION,
+
         ADD COLUMN IF NOT EXISTS unreal_pnl DOUBLE PRECISION,
         ADD COLUMN IF NOT EXISTS realized_pnl DOUBLE PRECISION,
-        ADD COLUMN IF NOT EXISTS atr DOUBLE PRECISION;
+        ADD COLUMN IF NOT EXISTS atr DOUBLE PRECISION,
+
+        ADD COLUMN IF NOT EXISTS vix_prev DOUBLE PRECISION,
+        ADD COLUMN IF NOT EXISTS vix DOUBLE PRECISION;
         """)
         conn.commit()
 
@@ -220,13 +234,13 @@ while True:
         fut  = kite.ltp([FUT_SYMBOL])[FUT_SYMBOL]["last_price"]
         atr  = atr_builder.update(now, fut)
 
+        vix_prev, vix = get_vix()
+
         # ================= ENTRY =================
         if not position_open and is_near_strike(spot):
             atm = round_to_strike(spot)
 
-            ce_strike = atm
-            pe_strike = atm
-
+            ce_strike = pe_strike = atm
             ce_symbol = get_nearest_option(ce_strike, "CE")
             pe_symbol = get_nearest_option(pe_strike, "PE")
 
@@ -254,14 +268,15 @@ while True:
                 pe_ltp=pe_entry,
                 unreal_pnl=0.0,
                 realized_pnl=realized_pnl,
-                atr=atr
+                atr=atr,
+                vix_prev=vix_prev,
+                vix=vix
             )
 
         # ================= MONITOR =================
         if position_open:
             ce_ltp = kite.ltp([ce_symbol])[ce_symbol]["last_price"]
             pe_ltp = kite.ltp([pe_symbol])[pe_symbol]["last_price"]
-
             unreal = (ce_ltp - ce_entry + pe_ltp - pe_entry) * QTY_PER_LEG
 
             if unreal >= PROFIT_TARGET or unreal <= -STOP_LOSS:
@@ -284,7 +299,9 @@ while True:
                     pe_ltp=pe_ltp,
                     unreal_pnl=unreal,
                     realized_pnl=realized_pnl,
-                    atr=atr
+                    atr=atr,
+                    vix_prev=vix_prev,
+                    vix=vix
                 )
 
             elif time.time() - last_snapshot_ts >= SNAPSHOT_INTERVAL:
@@ -293,7 +310,7 @@ while True:
                 log_db(
                     timestamp=now,
                     status="RUNNING",
-                    event="",
+                    event="SNAPSHOT",
                     reason="",
                     spot=spot,
                     ce_symbol=ce_symbol,
@@ -306,7 +323,9 @@ while True:
                     pe_ltp=pe_ltp,
                     unreal_pnl=unreal,
                     realized_pnl=realized_pnl,
-                    atr=atr
+                    atr=atr,
+                    vix_prev=vix_prev,
+                    vix=vix
                 )
 
         time.sleep(TICK_INTERVAL)
