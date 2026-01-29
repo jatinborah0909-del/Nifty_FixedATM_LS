@@ -10,6 +10,8 @@ NIFTY LONG STRADDLE – SCHEMA SAFE (FIXED + VIX)
 ✔ FUT-based ATR (minute candles)
 ✔ ATR stored in DB
 ✔ CE / PE SYMBOL + STRIKE STORED
+✔ CE / PE EXIT PRICE STORED (NEW)
+✔ Separate EXIT row
 ✔ VIX (PREV CLOSE + LIVE) STORED
 ✔ AUTO schema migration
 ✔ Railway compatible
@@ -44,12 +46,19 @@ TICK_INTERVAL = 1
 
 MARKET_TZ = pytz.timezone("Asia/Kolkata")
 
+# =========================================================
+# TIME
+# =========================================================
+
 def parse_time(t):
     h, m = map(int, t.split(":"))
     return dt_time(h, m)
 
 MARKET_START = parse_time(MARKET_START_TIME)
 MARKET_END   = parse_time(MARKET_END_TIME)
+
+def in_market_hours(now):
+    return MARKET_START <= now.time() <= MARKET_END
 
 # =========================================================
 # KITE
@@ -59,19 +68,19 @@ kite = KiteConnect(api_key=API_KEY)
 kite.set_access_token(ACCESS_TOKEN)
 
 # =========================================================
-# INSTRUMENT RESOLUTION
+# INSTRUMENTS
 # =========================================================
 
-NFO_INSTRUMENTS = kite.instruments("NFO")
+NFO = kite.instruments("NFO")
 
 def get_nearest_nifty_fut():
-    futs = [i for i in NFO_INSTRUMENTS if i["name"] == "NIFTY" and i["instrument_type"] == "FUT"]
+    futs = [i for i in NFO if i["name"] == "NIFTY" and i["instrument_type"] == "FUT"]
     futs.sort(key=lambda x: x["expiry"])
     return "NFO:" + futs[0]["tradingsymbol"]
 
 def get_nearest_option(strike, opt_type):
     opts = [
-        i for i in NFO_INSTRUMENTS
+        i for i in NFO
         if i["name"] == "NIFTY"
         and i["instrument_type"] == opt_type
         and i["strike"] == strike
@@ -82,7 +91,6 @@ def get_nearest_option(strike, opt_type):
     return "NFO:" + opts[0]["tradingsymbol"]
 
 FUT_SYMBOL = get_nearest_nifty_fut()
-print("✅ FUT:", FUT_SYMBOL)
 
 # =========================================================
 # VIX
@@ -91,12 +99,10 @@ print("✅ FUT:", FUT_SYMBOL)
 def get_vix():
     q = kite.quote(["NSE:INDIA VIX"])
     d = q["NSE:INDIA VIX"]
-    vix_prev = float(d["ohlc"]["close"]) if d.get("ohlc") else None
-    vix = float(d["last_price"]) if d.get("last_price") else None
-    return vix_prev, vix
+    return float(d["ohlc"]["close"]), float(d["last_price"])
 
 # =========================================================
-# ATR BUILDER
+# ATR
 # =========================================================
 
 class FutAtrBuilder:
@@ -108,9 +114,6 @@ class FutAtrBuilder:
         self.atr = None
 
     def update(self, now, ltp):
-        if ltp is None or math.isnan(ltp):
-            return self.atr
-
         mk = now.replace(second=0, microsecond=0)
 
         if self.last_min is None:
@@ -140,7 +143,7 @@ class FutAtrBuilder:
         return self.atr
 
 # =========================================================
-# DB (AUTO MIGRATING)
+# DB
 # =========================================================
 
 def get_conn():
@@ -168,13 +171,14 @@ def ensure_table():
 
         ADD COLUMN IF NOT EXISTS ce_entry DOUBLE PRECISION,
         ADD COLUMN IF NOT EXISTS pe_entry DOUBLE PRECISION,
+        ADD COLUMN IF NOT EXISTS ce_exit DOUBLE PRECISION,
+        ADD COLUMN IF NOT EXISTS pe_exit DOUBLE PRECISION,
         ADD COLUMN IF NOT EXISTS ce_ltp DOUBLE PRECISION,
         ADD COLUMN IF NOT EXISTS pe_ltp DOUBLE PRECISION,
 
         ADD COLUMN IF NOT EXISTS unreal_pnl DOUBLE PRECISION,
         ADD COLUMN IF NOT EXISTS realized_pnl DOUBLE PRECISION,
         ADD COLUMN IF NOT EXISTS atr DOUBLE PRECISION,
-
         ADD COLUMN IF NOT EXISTS vix_prev DOUBLE PRECISION,
         ADD COLUMN IF NOT EXISTS vix DOUBLE PRECISION;
         """)
@@ -211,16 +215,12 @@ def round_to_strike(price):
 def is_near_strike(spot):
     return abs(spot - round_to_strike(spot)) <= ENTRY_TOL
 
-def in_market_hours(now):
-    t = now.time()
-    return MARKET_START <= t <= MARKET_END
-
 # =========================================================
 # MAIN LOOP
 # =========================================================
 
 ensure_table()
-print("🚀 Bot started")
+print("🚀 NIFTY LONG STRADDLE STARTED")
 
 while True:
     try:
@@ -241,8 +241,8 @@ while True:
             atm = round_to_strike(spot)
 
             ce_strike = pe_strike = atm
-            ce_symbol = get_nearest_option(ce_strike, "CE")
-            pe_symbol = get_nearest_option(pe_strike, "PE")
+            ce_symbol = get_nearest_option(atm, "CE")
+            pe_symbol = get_nearest_option(atm, "PE")
 
             if not ce_symbol or not pe_symbol:
                 time.sleep(1)
@@ -264,9 +264,11 @@ while True:
                 pe_strike=pe_strike,
                 ce_entry=ce_entry,
                 pe_entry=pe_entry,
+                ce_exit=None,
+                pe_exit=None,
                 ce_ltp=ce_entry,
                 pe_ltp=pe_entry,
-                unreal_pnl=0.0,
+                unreal_pnl=0,
                 realized_pnl=realized_pnl,
                 atr=atr,
                 vix_prev=vix_prev,
@@ -286,7 +288,7 @@ while True:
                 log_db(
                     timestamp=now,
                     status="EXIT",
-                    event="EXIT",
+                    event="FINAL_EXIT",
                     reason="TARGET" if unreal >= PROFIT_TARGET else "SL",
                     spot=spot,
                     ce_symbol=ce_symbol,
@@ -295,6 +297,8 @@ while True:
                     pe_strike=pe_strike,
                     ce_entry=ce_entry,
                     pe_entry=pe_entry,
+                    ce_exit=ce_ltp,
+                    pe_exit=pe_ltp,
                     ce_ltp=ce_ltp,
                     pe_ltp=pe_ltp,
                     unreal_pnl=unreal,
@@ -319,6 +323,8 @@ while True:
                     pe_strike=pe_strike,
                     ce_entry=ce_entry,
                     pe_entry=pe_entry,
+                    ce_exit=None,
+                    pe_exit=None,
                     ce_ltp=ce_ltp,
                     pe_ltp=pe_ltp,
                     unreal_pnl=unreal,
